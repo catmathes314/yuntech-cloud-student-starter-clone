@@ -120,17 +120,10 @@ PREVIEW
 require_approval APPROVE_UP "尚未核准建立資源。"
 
 # ---------------------------------------------------------------------
-EXISTING_SG="$(read_resource sg_id)"
-EXISTING_KEY="$(read_resource key_pair_id)"
-EXISTING_INSTANCE="$(read_resource instance_id)"
+echo "== 6/8 建立資源（逐項檢查：缺什麼補建什麼）=="
 
-if [[ -n "$EXISTING_SG" || -n "$EXISTING_KEY" || -n "$EXISTING_INSTANCE" ]]; then
-  echo "== 6/8 偵測到 .local/resources.json 已有資源（可能是上次未完成）=="
-  echo "  sg=$EXISTING_SG key=$EXISTING_KEY instance=$EXISTING_INSTANCE"
-  echo "  跳過建立，直接進入驗證階段（若要重來請先執行 deploy/down.sh）。"
-else
-  echo "== 6/8 建立資源 =="
-
+SG_ID="$(read_resource sg_id)"
+if [[ -z "$SG_ID" ]]; then
   echo "-- 6a/建立 Security Group --"
   DEFAULT_VPC="$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0]')"
   VPC_ID="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["VpcId"])' "$DEFAULT_VPC")"
@@ -146,17 +139,30 @@ else
   aws ec2 authorize-security-group-ingress \
     --group-id "$SG_ID" --ip-permissions \
     "[{\"IpProtocol\":\"tcp\",\"FromPort\":22,\"ToPort\":22,\"IpRanges\":[{\"CidrIp\":\"$SOURCE_CIDR\"}]},{\"IpProtocol\":\"tcp\",\"FromPort\":80,\"ToPort\":80,\"IpRanges\":[{\"CidrIp\":\"$SOURCE_CIDR\"}]}]" >/dev/null
+else
+  echo "-- 6a/SG 已存在: $SG_ID，跳過（含入站規則）--"
+fi
 
-  echo "-- 6b/匯入 Key Pair（只送公鑰內容）--"
+KEY_PAIR_ID="$(read_resource key_pair_id)"
+if [[ -z "$KEY_PAIR_ID" ]]; then
+  echo "-- 6b/匯入 Key Pair（只送公鑰內容；用 file:// 讓 CLI 自動 base64 一次）--"
   PUBKEY="$(ssh-keygen -y -f "$KEY_FILE")"
+  PUBKEY_FILE=".local/w03-key.pub"
+  umask 077
+  echo "$PUBKEY" > "$PUBKEY_FILE"
   KP_JSON="$(aws ec2 import-key-pair \
     --key-name "$KEY_NAME" \
-    --public-key-material "$PUBKEY" \
+    --public-key-material "file://$PUBKEY_FILE" \
     --tag-specifications "ResourceType=key-pair,Tags=[{Key=course,Value=yuntech-115-1},{Key=week,Value=w03},{Key=group,Value=$GROUP},{Key=owner,Value=$OWNER}]")"
   KEY_PAIR_ID="$(json_get "$KP_JSON" KeyPairId)"
   write_resource key_pair_id "$KEY_PAIR_ID"
   write_resource key_file "$KEY_FILE"
+else
+  echo "-- 6b/key pair 已存在: $KEY_PAIR_ID，跳過 --"
+fi
 
+INSTANCE_ID="$(read_resource instance_id)"
+if [[ -z "$INSTANCE_ID" ]]; then
   echo "-- 6c/啟動 EC2 instance --"
   RUN_JSON="$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
@@ -174,6 +180,8 @@ else
   write_resource commit "$FULL_COMMIT"
   write_resource created_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "instance: $INSTANCE_ID"
+else
+  echo "-- 6c/instance 已存在: $INSTANCE_ID，跳過 --"
 fi
 
 INSTANCE_ID="$(read_resource instance_id)"
