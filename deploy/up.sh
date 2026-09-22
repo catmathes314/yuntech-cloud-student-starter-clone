@@ -145,14 +145,12 @@ fi
 
 KEY_PAIR_ID="$(read_resource key_pair_id)"
 if [[ -z "$KEY_PAIR_ID" ]]; then
-  echo "-- 6b/匯入 Key Pair（只送公鑰內容；用 file:// 讓 CLI 自動 base64 一次）--"
+  echo "-- 6b/匯入 Key Pair（公鑰先自行 base64；此環境 CLI 對 file:// 不自動編碼）--"
   PUBKEY="$(ssh-keygen -y -f "$KEY_FILE")"
-  PUBKEY_FILE=".local/w03-key.pub"
-  umask 077
-  echo "$PUBKEY" > "$PUBKEY_FILE"
+  PUBKEY_B64="$(printf '%s' "$PUBKEY" | base64 -w0)"
   KP_JSON="$(aws ec2 import-key-pair \
     --key-name "$KEY_NAME" \
-    --public-key-material "file://$PUBKEY_FILE" \
+    --public-key-material "$PUBKEY_B64" \
     --tag-specifications "ResourceType=key-pair,Tags=[{Key=course,Value=yuntech-115-1},{Key=week,Value=w03},{Key=group,Value=$GROUP},{Key=owner,Value=$OWNER}]")"
   KEY_PAIR_ID="$(json_get "$KP_JSON" KeyPairId)"
   write_resource key_pair_id "$KEY_PAIR_ID"
