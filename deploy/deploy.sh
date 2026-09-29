@@ -142,6 +142,14 @@ if [[ ! "$OLD_VERSION" =~ ^[0-9a-f]{40}$ ]]; then
   echo "STOP: existing /health returned an invalid version; no deployment performed" >&2
   exit 1
 fi
+if ! git cat-file -e "${OLD_VERSION}^{commit}" 2>/dev/null; then
+  echo "STOP: current service version is not available as a local commit; rollback cannot be prepared" >&2
+  exit 1
+fi
+EXPECT_AUTH=false
+if git grep -q '"auth_configured"' "$FULL_COMMIT" -- app/service.py; then
+  EXPECT_AUTH=true
+fi
 
 USER_DATA=".local/w04-user-data-${FULL_COMMIT}.sh"
 if [[ -e "$USER_DATA" || -L "$USER_DATA" ]]; then
@@ -157,10 +165,11 @@ W4 deployment preview (no AWS resources will be created or Security Group rules 
   Security Group : $SG_ID (TCP 22/80 remain restricted to $CURRENT_CIDR)
   Current version: $OLD_VERSION
   New commit     : $FULL_COMMIT
+  Rollback       : redeploy current version $OLD_VERSION if W4 verification fails
   Secret file    : local mode 600; sent only over SSH stdin; remote root-owned mode 600
   Service impact : inspection restarts; in-memory events are cleared; brief HTTP interruption
   New resources  : none; no additional resource charges. Existing running EC2/EBS/IP charges continue.
-  Recovery       : rerun with the previous service commit and the same token file; verify /health.
+  Recovery       : rerun with $OLD_VERSION and the same token file; W3 rollback will not expose W4 endpoints.
 PREVIEW
 if [[ ! -t 0 ]]; then
   echo "STOP: interactive confirmation is required; no deployment performed" >&2
@@ -193,16 +202,16 @@ if [[ "$HEALTH_OUTPUT" != *"HTTP_CODE:200"* ]]; then
   echo "STOP: deployed /health is not HTTP 200; use the recovery procedure above" >&2
   exit 1
 fi
-python3 - "$HEALTH_OUTPUT" "$FULL_COMMIT" <<'PY'
+python3 - "$HEALTH_OUTPUT" "$FULL_COMMIT" "$EXPECT_AUTH" <<'PY'
 import json, sys
-body, expected = sys.argv[1].rsplit("HTTP_CODE:", 1)[0], sys.argv[2]
+body, expected, expect_auth = sys.argv[1].rsplit("HTTP_CODE:", 1)[0], sys.argv[2], sys.argv[3] == "true"
 try:
     result = json.loads(body)
 except json.JSONDecodeError:
     raise SystemExit("STOP: deployed health response is invalid JSON.") from None
-if result.get("version") != expected or result.get("auth_configured") is not True:
-    raise SystemExit("STOP: deployed version or auth_configured does not match the deployment contract.")
-print("Verified /health: HTTP 200, version matches commit, auth_configured=true.")
+if result.get("version") != expected or (expect_auth and result.get("auth_configured") is not True):
+  raise SystemExit("STOP: deployed version or auth configuration does not match the selected commit.")
+print(f"Verified /health: HTTP 200, version matches commit, auth_configured={result.get('auth_configured', 'absent')}.")
 PY
 
 echo "W4 deployment completed for $INSTANCE_ID at $PUBLIC_IP, commit $FULL_COMMIT."
