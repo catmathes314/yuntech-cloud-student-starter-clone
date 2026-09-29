@@ -1,0 +1,7 @@
+{
+  "event_id": "group7-1-0002",
+  "device_id": "g7-device-01",
+  "observed_at": "2026-09-29T10:05:00",
+  "type": "anomaly",
+  "note": "Timestamp intentionally lacks a timezone"
+}
