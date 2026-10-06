@@ -190,11 +190,13 @@ echo "== 7/8 等待與五層觀測 =="
 T() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 # t1: running
+T1=""
 for i in $(seq 1 60); do
   ST="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name')"
-  if [[ "$ST" == '"running"' ]]; then T1="$(T)"; echo "t1 running:        $T1"; break; fi
+  if [[ "$ST" == "running" ]]; then T1="$(T)"; echo "t1 running:        $T1"; break; fi
   sleep 3
 done
+[[ -n "$T1" ]] || { echo "STOP: instance did not reach running state within 3 minutes" >&2; exit 1; }
 PUBLIC_IP=""
 for i in $(seq 1 30); do
   PUBLIC_IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' | tr -d '"')"

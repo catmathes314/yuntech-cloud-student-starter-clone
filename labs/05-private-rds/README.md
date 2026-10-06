@@ -50,7 +50,7 @@ Codespace ──▶ RDS:5432   ✗ 逾時
 | 建私有子網、資料庫的腳本 | `deploy/db-up.sh` |
 | 事件改存進資料庫、照冪等規則回應 | `app/service.py` |
 | 部署時多放資料庫的秘密 | `deploy/deploy.sh`（W4 寫的，加一件事） |
-| 冪等矩陣腳本（5 列一次跑完） | `tests/` 底下，檔名自訂 |
+| 冪等矩陣腳本（5 列一次跑完） | `tests/w05_idempotency_matrix.py` |
 
 ## 任務卡
 
@@ -76,6 +76,8 @@ timeout 8 bash -c 'echo > /dev/tcp/<你的 RDS 位址>/5432' && echo "連得到�
 3. 建 RDS：PostgreSQL、`db.t3.micro`、儲存 20 GiB gp3、不公開、儲存加密、單一 AZ、初始資料庫 `inspection`。
 4. 密碼由腳本產生、寫進 `.local/db.env`（600），不顯示，也不能出現在命令列參數。
 5. 每建一項就把 ID 寫進 `.local/resources.json`；結束時讀回 `available` 與 `PubliclyAccessible=false`。
+
+執行 `bash deploy/db-up.sh` 前，先審查它印出的兩個子網 CIDR/AZ、路由表、SG-db 來源、RDS 規格與費用項目；確認範圍已核准後，才在提示輸入 `CREATE-W05-RDS`。腳本會明確關閉子網的自動公有 IPv4、確認新路由表只有 `local` 路由，並等待 RDS 成為 `available`。若預覽與核准內容不一致，取消而不要繼續。
 
 `deploy.sh` 本週多一件事：把 `.local/db.env` 的內容一起放進主機的秘密檔，放完再重啟服務。
 
@@ -103,6 +105,8 @@ timeout 8 bash -c 'echo > /dev/tcp/<你的 RDS 位址>/5432' && echo "連得到�
 | 3 | 同 ID、`note` 不同 | 409 |
 | 4 | `sudo systemctl restart inspection` 後查 #1 | 還在 |
 | 5 | 在 EC2 上用 `psql` 查 #1 的筆數 | 1 |
+
+完成部署與 `/health` 驗收後，在 repo 根目錄執行 `python3 tests/w05_idempotency_matrix.py`。腳本從 `.local/resources.json` 取得目前 EC2 位址、從權限為 600 的 `.local/app.env` 讀取權杖；它會重啟服務並在 EC2 上以 `psql` 查詢，因此請保留這兩個本機檔案與 SSH 私鑰。輸出不含權杖、密碼或 Authorization 標頭。
 
 第 5 列在 EC2 上這樣查（密碼從秘密檔讀進環境變數，不出現在命令列；`<你的 event_id>` 換成 #1 的值）：
 

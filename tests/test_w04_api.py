@@ -28,6 +28,11 @@ class EventApiContract(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "REPORTER_TOKEN": REPORTER_TOKEN,
             "OPERATOR_TOKEN": OPERATOR_TOKEN,
+            "DB_HOST": "",
+            "DB_PORT": "",
+            "DB_NAME": "",
+            "DB_USER": "",
+            "DB_PASSWORD": "",
         })
         self.environment.start()
         self.server = service.make_server(version_file, port=0)
@@ -81,6 +86,7 @@ class EventApiContract(unittest.TestCase):
         self.assertEqual(result["service"], "inspection")
         self.assertEqual(result["version"], "a" * 40)
         self.assertIs(result["auth_configured"], True)
+        self.assertIs(result["db_configured"], False)
 
     def test_fixtures_create_and_reject_events(self):
         status, created = self.request(
@@ -128,6 +134,11 @@ class EventApiContract(unittest.TestCase):
         self.assertEqual(status, 201)
 
         status, result = self.request("POST", "/events", event, REPORTER_TOKEN)
+        self.assertEqual(status, 409)
+        self.assert_error(result, "event_id")
+
+        changed = dict(event, note="different content")
+        status, result = self.request("POST", "/events", changed, REPORTER_TOKEN)
         self.assertEqual(status, 409)
         self.assert_error(result, "event_id")
 

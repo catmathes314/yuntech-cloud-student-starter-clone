@@ -9,6 +9,7 @@ cd "$ROOT"
 CONFIG="${CONFIG:-.local/config}"
 RESOURCES=".local/resources.json"
 APP_ENV=".local/app.env"
+DB_ENV=".local/db.env"
 if [[ ! -f "$CONFIG" || -L "$CONFIG" ]]; then
   echo "STOP: missing or unsafe $CONFIG" >&2
   exit 1
@@ -55,6 +56,31 @@ try:
 except (OSError, UnicodeError, ValueError):
     raise SystemExit("STOP: token file must contain two distinct ASCII tokens.") from None
 PY
+if [[ -e "$DB_ENV" || -L "$DB_ENV" ]]; then
+  if [[ ! -f "$DB_ENV" || -L "$DB_ENV" || "$(stat -c '%a' "$DB_ENV")" != "600" ]]; then
+    echo "STOP: $DB_ENV is unsafe or permissions are not 600" >&2
+    exit 1
+  fi
+  python3 - "$DB_ENV" <<'PY'
+import re, sys
+from pathlib import Path
+expected = {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
+values = {}
+try:
+    for line in Path(sys.argv[1]).read_text(encoding="ascii").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in expected or key in values or not value:
+            raise ValueError
+        values[key] = value
+    if (set(values) != expected or values["DB_PORT"] != "5432"
+            or values["DB_NAME"] != "inspection" or values["DB_USER"] != "inspection"
+            or not re.fullmatch(r"[A-Za-z0-9.-]+", values["DB_HOST"])
+            or not re.fullmatch(r"[A-Za-z0-9_-]{32,}", values["DB_PASSWORD"])):
+        raise ValueError
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit("STOP: database secret file has an invalid format.") from None
+PY
+fi
 
 COMMIT_REF="${1:-HEAD}"
 FULL_COMMIT="$(git rev-parse --verify --end-of-options "${COMMIT_REF}^{commit}")"
@@ -150,6 +176,12 @@ EXPECT_AUTH=false
 if git grep -q '"auth_configured"' "$FULL_COMMIT" -- app/service.py; then
   EXPECT_AUTH=true
 fi
+EXPECT_DB=false
+if [[ -f "$DB_ENV" ]]; then
+  if git grep -q '"db_configured"' "$FULL_COMMIT" -- app/service.py; then
+    EXPECT_DB=true
+  fi
+fi
 
 USER_DATA=".local/w04-user-data-${FULL_COMMIT}.sh"
 if [[ -e "$USER_DATA" || -L "$USER_DATA" ]]; then
@@ -166,7 +198,8 @@ W4 deployment preview (no AWS resources will be created or Security Group rules 
   Current version: $OLD_VERSION
   New commit     : $FULL_COMMIT
   Rollback       : redeploy current version $OLD_VERSION if W4 verification fails
-  Secret file    : local mode 600; sent only over SSH stdin; remote root-owned mode 600
+  Secret files   : local mode 600; tokens and optional DB settings sent only over SSH stdin;
+                   remote root-owned mode 600
   Service impact : inspection restarts; in-memory events are cleared; brief HTTP interruption
   New resources  : none; no additional resource charges. Existing running EC2/EBS/IP charges continue.
   Recovery       : rerun with $OLD_VERSION and the same token file; W3 rollback will not expose W4 endpoints.
@@ -186,7 +219,14 @@ SSH_TARGET="${SSH_USER}@${PUBLIC_IP}"
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" true
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo bash -s' < "$USER_DATA"
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo install -d -o root -g root -m 700 /etc/inspection'
-ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo python3 -c '\''import os,sys; data=sys.stdin.buffer.read(4097); allowed={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN="}; lines=data.splitlines(); keys=[line.partition(b"=")[0]+b"=" for line in lines]; values=[line.partition(b"=")[2] for line in lines]; assert len(data)<=4096 and len(lines)==2 and set(keys)==allowed and all(values) and values[0]!=values[1]; fd=os.open("/etc/inspection/app.env",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600); os.fchown(fd,0,0); os.fchmod(fd,0o600); stream=os.fdopen(fd,"wb"); stream.write(data); stream.close()'\''' < "$APP_ENV"
+COMBINED_ENV="$(mktemp .local/deploy-env.XXXXXX)"
+trap 'rm -f -- "$USER_DATA" "$COMBINED_ENV"' EXIT
+cat "$APP_ENV" > "$COMBINED_ENV"
+if [[ -f "$DB_ENV" && ! -L "$DB_ENV" ]]; then
+  cat "$DB_ENV" >> "$COMBINED_ENV"
+fi
+chmod 600 "$COMBINED_ENV"
+ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo python3 -c '\''import os,sys; data=sys.stdin.buffer.read(8193); allowed={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN=",b"DB_HOST=",b"DB_PORT=",b"DB_NAME=",b"DB_USER=",b"DB_PASSWORD="}; lines=data.splitlines(); keys=[line.partition(b"=")[0]+b"=" for line in lines]; values=[line.partition(b"=")[2] for line in lines]; required={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN="}; assert len(data)<=8192 and len(lines) in (2,7) and len(set(keys))==len(keys) and required.issubset(set(keys)) and set(keys).issubset(allowed) and all(values); assert values[keys.index(b"REPORTER_TOKEN=")] != values[keys.index(b"OPERATOR_TOKEN=")]; fd=os.open("/etc/inspection/app.env",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600); os.fchown(fd,0,0); os.fchmod(fd,0o600); stream=os.fdopen(fd,"wb"); stream.write(data); stream.close()'\''' < "$COMBINED_ENV"
 REMOTE_SECRET_MODE="$(ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo stat -c "%a %U %G" /etc/inspection/app.env')"
 if [[ "$REMOTE_SECRET_MODE" != "600 root root" ]]; then
   echo "STOP: remote secret-file owner or mode is incorrect" >&2
@@ -202,16 +242,23 @@ if [[ "$HEALTH_OUTPUT" != *"HTTP_CODE:200"* ]]; then
   echo "STOP: deployed /health is not HTTP 200; use the recovery procedure above" >&2
   exit 1
 fi
-python3 - "$HEALTH_OUTPUT" "$FULL_COMMIT" "$EXPECT_AUTH" <<'PY'
+python3 - "$HEALTH_OUTPUT" "$FULL_COMMIT" "$EXPECT_AUTH" "$EXPECT_DB" <<'PY'
 import json, sys
-body, expected, expect_auth = sys.argv[1].rsplit("HTTP_CODE:", 1)[0], sys.argv[2], sys.argv[3] == "true"
+body, expected = sys.argv[1].rsplit("HTTP_CODE:", 1)[0], sys.argv[2]
+expect_auth, expect_db = sys.argv[3] == "true", sys.argv[4] == "true"
 try:
     result = json.loads(body)
 except json.JSONDecodeError:
     raise SystemExit("STOP: deployed health response is invalid JSON.") from None
-if result.get("version") != expected or (expect_auth and result.get("auth_configured") is not True):
+if (result.get("version") != expected
+        or (expect_auth and result.get("auth_configured") is not True)
+        or (expect_db and result.get("db_configured") is not True)):
   raise SystemExit("STOP: deployed version or auth configuration does not match the selected commit.")
-print(f"Verified /health: HTTP 200, version matches commit, auth_configured={result.get('auth_configured', 'absent')}.")
+print(
+    "Verified /health: HTTP 200, version matches commit, "
+    f"auth_configured={result.get('auth_configured', 'absent')}, "
+    f"db_configured={result.get('db_configured', 'absent')}."
+)
 PY
 
 echo "W4 deployment completed for $INSTANCE_ID at $PUBLIC_IP, commit $FULL_COMMIT."

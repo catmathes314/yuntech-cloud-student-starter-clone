@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -76,6 +77,8 @@ DISPLAY_PAGE = """<!doctype html>
 </html>
 """
 
+LOGGER = logging.getLogger(__name__)
+
 
 def make_server(version_file, port=8080):
     version = Path(version_file).read_text(encoding="utf-8").strip()
@@ -90,8 +93,42 @@ def make_server(version_file, port=8080):
     auth_configured = bool(
         reporter_token and operator_token and not hmac.compare_digest(reporter_token, operator_token)
     )
+    db_host = os.environ.get("DB_HOST", "")
+    db_name = os.environ.get("DB_NAME", "")
+    db_user = os.environ.get("DB_USER", "")
+    db_password = os.environ.get("DB_PASSWORD", "")
+    db_port_text = os.environ.get("DB_PORT", "5432")
+    try:
+        db_port = int(db_port_text)
+    except ValueError:
+        db_port = 0
+    db_configured = bool(
+        db_host and db_name and db_user and db_password and 1 <= db_port <= 65535
+    )
     events = {}
     events_lock = threading.Lock()
+
+    def event_from_row(row):
+        event = dict(zip(
+            ("event_id", "device_id", "observed_at", "type", "note", "received_at"),
+            row,
+        ))
+        for field in ("observed_at", "received_at"):
+            value = event[field]
+            if isinstance(value, datetime):
+                event[field] = value.isoformat().replace("+00:00", "Z")
+        return event
+
+    def ensure_events_table(cursor):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS events ("
+            "event_id TEXT PRIMARY KEY, "
+            "device_id TEXT NOT NULL, "
+            "observed_at TIMESTAMPTZ NOT NULL, "
+            "event_type TEXT NOT NULL, "
+            "note TEXT, "
+            "received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -109,6 +146,31 @@ def make_server(version_file, port=8080):
 
         def send_error_json(self, status, error, field):
             self.send_json(status, {"error": error, "field": field})
+
+        def postgres_driver(self):
+            try:
+                import psycopg2
+            except ImportError:
+                LOGGER.error("PostgreSQL driver is unavailable.")
+                self.send_error_json(503, "database_unavailable", "database")
+                return None
+            return psycopg2
+
+        def postgres_connection(self, psycopg2):
+            return psycopg2.connect(
+                host=db_host,
+                port=db_port,
+                dbname=db_name,
+                user=db_user,
+                password=db_password,
+                sslmode="verify-full",
+                sslrootcert="/etc/inspection/rds-ca.pem",
+                connect_timeout=5,
+            )
+
+        def report_database_error(self, error):
+            LOGGER.warning("PostgreSQL operation failed (%s).", type(error).__name__)
+            self.send_error_json(503, "database_unavailable", "database")
 
         def send_page(self):
             data = DISPLAY_PAGE.encode("utf-8")
@@ -211,6 +273,7 @@ def make_server(version_file, port=8080):
                     "version": version,
                     "started_at": started,
                     "auth_configured": auth_configured,
+                    "db_configured": db_configured,
                 })
                 return
             if path == "/":
@@ -219,8 +282,26 @@ def make_server(version_file, port=8080):
             if path == "/events":
                 if not self.authorize("operator"):
                     return
-                with events_lock:
-                    latest = list(reversed(list(events.values())))[:50]
+                if db_configured:
+                    psycopg2 = self.postgres_driver()
+                    if psycopg2 is None:
+                        return
+                    try:
+                        with self.postgres_connection(psycopg2) as connection:
+                            with connection.cursor() as cursor:
+                                ensure_events_table(cursor)
+                                cursor.execute(
+                                    "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                                    "FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                                    (50,),
+                                )
+                                latest = [event_from_row(row) for row in cursor.fetchall()]
+                    except psycopg2.Error as error:
+                        self.report_database_error(error)
+                        return
+                else:
+                    with events_lock:
+                        latest = list(reversed(list(events.values())))[:50]
                 self.send_json(200, latest)
                 return
             if path.startswith("/events/"):
@@ -230,8 +311,27 @@ def make_server(version_file, port=8080):
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", event_id):
                     self.send_error_json(404, "not_found", "event_id")
                     return
-                with events_lock:
-                    item = events.get(event_id)
+                if db_configured:
+                    psycopg2 = self.postgres_driver()
+                    if psycopg2 is None:
+                        return
+                    try:
+                        with self.postgres_connection(psycopg2) as connection:
+                            with connection.cursor() as cursor:
+                                ensure_events_table(cursor)
+                                cursor.execute(
+                                    "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                                    "FROM events WHERE event_id = %s",
+                                    (event_id,),
+                                )
+                                row = cursor.fetchone()
+                                item = event_from_row(row) if row is not None else None
+                    except psycopg2.Error as error:
+                        self.report_database_error(error)
+                        return
+                else:
+                    with events_lock:
+                        item = events.get(event_id)
                 if item is None:
                     self.send_error_json(404, "not_found", "event_id")
                     return
@@ -249,6 +349,64 @@ def make_server(version_file, port=8080):
             if body is None or not self.validate_event(body):
                 return
             event_id = body["event_id"]
+            if db_configured:
+                psycopg2 = self.postgres_driver()
+                if psycopg2 is None:
+                    return
+                try:
+                    with self.postgres_connection(psycopg2) as connection:
+                        with connection.cursor() as cursor:
+                            ensure_events_table(cursor)
+                            cursor.execute(
+                                "INSERT INTO events "
+                                "(event_id, device_id, observed_at, event_type, note) "
+                                "VALUES (%s, %s, %s, %s, %s) "
+                                "ON CONFLICT (event_id) DO NOTHING "
+                                "RETURNING event_id, device_id, observed_at, event_type, note, received_at",
+                                (
+                                    body["event_id"],
+                                    body["device_id"],
+                                    body["observed_at"],
+                                    body["type"],
+                                    body.get("note"),
+                                ),
+                            )
+                            row = cursor.fetchone()
+                            if row is not None:
+                                item = event_from_row(row)
+                                status = 201
+                            else:
+                                cursor.execute(
+                                    "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                                    "FROM events WHERE event_id = %s",
+                                    (event_id,),
+                                )
+                                existing_row = cursor.fetchone()
+                                if existing_row is None:
+                                    self.send_error_json(500, "database_error", "database")
+                                    return
+                                item = event_from_row(existing_row)
+                                existing_time = datetime.fromisoformat(
+                                    item["observed_at"].replace("Z", "+00:00")
+                                )
+                                request_time = datetime.fromisoformat(
+                                    body["observed_at"].replace("Z", "+00:00")
+                                )
+                                identical = (
+                                    item["device_id"] == body["device_id"]
+                                    and existing_time == request_time
+                                    and item["type"] == body["type"]
+                                    and item["note"] == body.get("note")
+                                )
+                                if not identical:
+                                    self.send_error_json(409, "event_id_conflict", "event_id")
+                                    return
+                                status = 200
+                except psycopg2.Error as error:
+                    self.report_database_error(error)
+                    return
+                self.send_json(status, item)
+                return
             with events_lock:
                 if event_id in events:
                     self.send_error_json(409, "duplicate_event_id", "event_id")

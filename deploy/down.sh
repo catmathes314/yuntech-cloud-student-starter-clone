@@ -76,7 +76,7 @@ if action == "exists":
         state = out["Reservations"][0]["Instances"][0]["State"]["Name"]
         print("present" if state != "terminated" else "absent")
     elif rtype in ("volume", "network-interface"):
-        items = out[rtype + "s"] if rtype == "volume" else out["NetworkInterfaces"]
+        items = out["Volumes"] if rtype == "volume" else out["NetworkInterfaces"]
         print("present" if items else "absent")
     else:
         print("present")
@@ -113,18 +113,25 @@ require_approval() { # require_approval <env_var> <說明>
 }
 
 # --- 讀入 resources.json ---
-INSTANCE_ID="$(python3 -c 'import json,sys;print(json.loads(open(".local/resources.json")).get("instance_id",""))')"
-SG_ID="$(python3 -c 'import json,sys;print(json.loads(open(".local/resources.json")).get("sg_id",""))')"
-KEY_NAME="$(python3 -c 'import json,sys;print(json.loads(open(".local/resources.json")).get("key_name",""))')"
-KEY_ID="$(python3 -c 'import json,sys;print(json.loads(open(".local/resources.json")).get("key_pair_id",""))')"
+read_resource() {
+  python3 - "$1" <<'PY'
+import json, sys
+with open(".local/resources.json", encoding="utf-8") as resources:
+    print(json.load(resources).get(sys.argv[1], ""))
+PY
+}
+INSTANCE_ID="$(read_resource instance_id)"
+SG_ID="$(read_resource sg_id)"
+KEY_NAME="$(read_resource key_name)"
+KEY_ID="$(read_resource key_pair_id)"
 
 [[ -n "$INSTANCE_ID" ]] || { echo "STOP: resources.json 沒有 instance_id" >&2; exit 1; }
 
 export GROUP OWNER  # 供 pycheck 讀取
 
-if [[ "$MODE" == "full" ]] && [[ "$(pycheck exists instance "$INSTANCE_ID")" == "absent" ]]; then
-  echo "STOP: instance $INSTANCE_ID 已不存在。這台可能已回收過；請先檢視 .local/resources.json 再決定是否繼續。" >&2
-  exit 1
+INSTANCE_STATE=""
+if [[ "$MODE" == "full" ]]; then
+  INSTANCE_STATE="$(pycheck exists instance "$INSTANCE_ID")"
 fi
 
 if [[ "$MODE" == "stop" ]]; then
@@ -136,11 +143,11 @@ if [[ "$MODE" == "stop" ]]; then
   aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
   for i in $(seq 1 40); do
     ST="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name')"
-    if [[ "$ST" == '"stopped"' ]]; then break; fi
+    if [[ "$ST" == "stopped" ]]; then break; fi
     sleep 3
   done
   echo "最終狀態: $ST"
-  [[ "$ST" == '"stopped"' ]] || { echo "STOP: 主機未停止" >&2; exit 1; }
+  [[ "$ST" == "stopped" ]] || { echo "STOP: 主機未停止" >&2; exit 1; }
   echo "OK：主機已停止並保留（下週 W4 啟動：公開 IP 會變，需重新核對）。"
   exit 0
 fi
@@ -157,27 +164,34 @@ PREVIEW
 require_approval APPROVE_DOWN "尚未核准回收。"
 
 echo "== 1/5 核對 instance 標籤並終止 =="
-[[ "$(pycheck tags instance "$INSTANCE_ID")" == "ok" ]] || { echo "STOP: instance 標籤不符，拒絕操作" >&2; exit 1; }
-aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
-for i in $(seq 1 60); do
-  [[ "$(pycheck exists instance "$INSTANCE_ID")" == "absent" ]] && break
-  sleep 3
-done
-echo "instance 已終止並消失。"
+if [[ "$INSTANCE_STATE" == "present" ]]; then
+  [[ "$(pycheck tags instance "$INSTANCE_ID")" == "ok" ]] || { echo "STOP: instance 標籤不符，拒絕操作" >&2; exit 1; }
+  aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
+  for i in $(seq 1 60); do
+    [[ "$(pycheck exists instance "$INSTANCE_ID")" == "absent" ]] && break
+    sleep 3
+  done
+fi
+[[ "$(pycheck exists instance "$INSTANCE_ID")" == "absent" ]] || { echo "STOP: instance 尚未終止" >&2; exit 1; }
+echo "instance 已終止或先前已終止。"
 
 echo "== 2/5 讀回根 EBS 已刪除 =="
 for i in $(seq 1 30); do
   [[ "$(pycheck exists volume "$INSTANCE_ID")" == "absent" ]] && break
   sleep 3
 done
-echo "根 EBS 讀回: $(pycheck exists volume "$INSTANCE_ID")（應為 absent）"
+EBS_STATE="$(pycheck exists volume "$INSTANCE_ID")"
+echo "根 EBS 讀回: $EBS_STATE（應為 absent）"
+[[ "$EBS_STATE" == "absent" ]] || { echo "STOP: 找到仍存在的附加磁碟；不繼續刪除其他資源" >&2; exit 1; }
 
 echo "== 3/5 讀回 ENI 已釋放 =="
 for i in $(seq 1 30); do
   [[ "$(pycheck exists network-interface "$INSTANCE_ID")" == "absent" ]] && break
   sleep 3
 done
-echo "ENI 讀回: $(pycheck exists network-interface "$INSTANCE_ID")（應為 absent）"
+ENI_STATE="$(pycheck exists network-interface "$INSTANCE_ID")"
+echo "ENI 讀回: $ENI_STATE（應為 absent）"
+[[ "$ENI_STATE" == "absent" ]] || { echo "STOP: 找到仍存在的附加網路介面；不繼續刪除其他資源" >&2; exit 1; }
 
 if [[ -n "$SG_ID" ]]; then
   echo "== 4/5 核對 SG 標籤並刪除 =="
