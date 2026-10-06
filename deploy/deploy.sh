@@ -218,7 +218,7 @@ SSH_OPTIONS=(-i "$KEY_FILE" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostK
 SSH_TARGET="${SSH_USER}@${PUBLIC_IP}"
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" true
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo bash -s' < "$USER_DATA"
-ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo install -d -o root -g root -m 700 /etc/inspection'
+ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo install -d -o root -g root -m 755 /etc/inspection'
 COMBINED_ENV="$(mktemp .local/deploy-env.XXXXXX)"
 trap 'rm -f -- "$USER_DATA" "$COMBINED_ENV"' EXIT
 cat "$APP_ENV" > "$COMBINED_ENV"

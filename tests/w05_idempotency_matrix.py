@@ -22,13 +22,15 @@ class MatrixError(Exception):
 def read_assignments(path, allowed):
     values = {}
     try:
-        for line in Path(path).read_text(encoding="ascii").splitlines():
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
             key, separator, value = line.partition("=")
             if not separator or key not in allowed or key in values:
                 raise ValueError
             values[key] = value
     except (OSError, UnicodeError, ValueError):
-        raise MatrixError("Local configuration file has an invalid format.") from None
+        raise MatrixError(Path(path).name + " has an invalid format.") from None
     return values
 
 
