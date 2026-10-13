@@ -168,6 +168,18 @@ class MqttCheckTests(unittest.TestCase):
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_local_config_reader_accepts_utf8_comments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config"
+            path.write_text(
+                "# Codespace 設定\nSSH_USER=ec2-user\nKEY_NAME=group-key\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                reconcile.read_assignments(path, {"SSH_USER", "KEY_NAME"}),
+                {"SSH_USER": "ec2-user", "KEY_NAME": "group-key"},
+            )
+
     def test_remote_reconciliation_shell_parses(self):
         result = subprocess.run(
             ["bash", "-n"],

@@ -79,7 +79,7 @@ printf '%s\n' 'consumer_log_end'
 def read_assignments(path, allowed):
     values = {}
     try:
-        for line in path.read_text(encoding="ascii").splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             key, separator, value = line.partition("=")
