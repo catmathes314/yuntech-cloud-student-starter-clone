@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 DISPLAY_PAGE = """<!doctype html>
@@ -29,6 +29,8 @@ DISPLAY_PAGE = """<!doctype html>
   <form id="token-form">
     <label for="operator-token">Operator token</label>
     <input id="operator-token" type="password" autocomplete="off" required>
+    <label for="device-id">Device ID</label>
+    <input id="device-id" type="text" autocomplete="off">
     <button type="submit">Load events</button>
   </form>
   <p id="message" role="status"></p>
@@ -36,6 +38,7 @@ DISPLAY_PAGE = """<!doctype html>
   <script>
     const form = document.querySelector('#token-form');
     const tokenInput = document.querySelector('#operator-token');
+    const deviceInput = document.querySelector('#device-id');
     const message = document.querySelector('#message');
     const eventList = document.querySelector('#events');
     let operatorToken = '';
@@ -45,8 +48,10 @@ DISPLAY_PAGE = """<!doctype html>
       tokenInput.value = '';
       message.textContent = 'Loading…';
       eventList.replaceChildren();
+      const deviceId = deviceInput.value.trim();
+      const query = deviceId ? '?device_id=' + encodeURIComponent(deviceId) : '';
       try {
-        const response = await fetch('/events', {
+        const response = await fetch('/events' + query, {
           headers: { 'Authorization': 'Bearer ' + operatorToken }
         });
         if (!response.ok) {
@@ -282,6 +287,17 @@ def make_server(version_file, port=8080):
             if path == "/events":
                 if not self.authorize("operator"):
                     return
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if (set(query) - {"device_id"}
+                        or len(query.get("device_id", [])) > 1):
+                    self.send_error_json(400, "invalid_query", "device_id")
+                    return
+                device_id = query.get("device_id", [None])[0]
+                if device_id is not None and not re.fullmatch(
+                    r"[A-Za-z0-9_-]{1,32}", device_id
+                ):
+                    self.send_error_json(400, "invalid_identifier", "device_id")
+                    return
                 if db_configured:
                     psycopg2 = self.postgres_driver()
                     if psycopg2 is None:
@@ -290,18 +306,32 @@ def make_server(version_file, port=8080):
                         with self.postgres_connection(psycopg2) as connection:
                             with connection.cursor() as cursor:
                                 ensure_events_table(cursor)
-                                cursor.execute(
-                                    "SELECT event_id, device_id, observed_at, event_type, note, received_at "
-                                    "FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
-                                    (50,),
-                                )
+                                if device_id is None:
+                                    cursor.execute(
+                                        "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                                        "FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                                        (50,),
+                                    )
+                                else:
+                                    cursor.execute(
+                                        "SELECT event_id, device_id, observed_at, event_type, note, received_at "
+                                        "FROM events WHERE device_id = %s "
+                                        "ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                                        (device_id, 50),
+                                    )
                                 latest = [event_from_row(row) for row in cursor.fetchall()]
                     except psycopg2.Error as error:
                         self.report_database_error(error)
                         return
                 else:
                     with events_lock:
-                        latest = list(reversed(list(events.values())))[:50]
+                        latest = list(reversed(list(events.values())))
+                        if device_id is not None:
+                            latest = [
+                                event for event in latest
+                                if event["device_id"] == device_id
+                            ]
+                        latest = latest[:50]
                 self.send_json(200, latest)
                 return
             if path.startswith("/events/"):

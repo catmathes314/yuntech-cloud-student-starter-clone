@@ -10,6 +10,10 @@ CONFIG="${CONFIG:-.local/config}"
 RESOURCES=".local/resources.json"
 APP_ENV=".local/app.env"
 DB_ENV=".local/db.env"
+if [[ -L ".local" || ! -d ".local" ]]; then
+  echo "STOP: missing or unsafe .local directory" >&2
+  exit 1
+fi
 if [[ ! -f "$CONFIG" || -L "$CONFIG" ]]; then
   echo "STOP: missing or unsafe $CONFIG" >&2
   exit 1
@@ -17,6 +21,11 @@ fi
 # shellcheck source=/dev/null
 . "$CONFIG"
 : "${GROUP:?}"; : "${OWNER:?}"; : "${REGION:?}"; : "${KEY_NAME:?}"; : "${SSH_USER:?}"
+CODE="${GROUP}-${OWNER}"
+if [[ ! "$CODE" =~ ^[A-Za-z0-9-]{1,40}$ ]]; then
+  echo "STOP: configured group/member code is invalid" >&2
+  exit 1
+fi
 
 if [[ ! -f "$RESOURCES" || -L "$RESOURCES" ]]; then
   echo "STOP: missing or unsafe $RESOURCES" >&2
@@ -82,18 +91,49 @@ except (OSError, UnicodeError, ValueError):
 PY
 fi
 
+IOT_DIR=".local/iot"
+if [[ ! -d "$IOT_DIR" || -L "$IOT_DIR" || "$(stat -c '%a' "$IOT_DIR")" != "700" ]]; then
+  echo "STOP: missing or unsafe $IOT_DIR (directory mode must be 700)" >&2
+  exit 1
+fi
+for IOT_FILE in endpoint AmazonRootCA1.pem consumer.cert.pem consumer.private.key; do
+  if [[ ! -f "$IOT_DIR/$IOT_FILE" || -L "$IOT_DIR/$IOT_FILE" ]]; then
+    echo "STOP: missing or unsafe $IOT_DIR/$IOT_FILE" >&2
+    exit 1
+  fi
+  if [[ "$(stat -c '%a' "$IOT_DIR/$IOT_FILE")" != "600" ]]; then
+    echo "STOP: $IOT_DIR/$IOT_FILE permissions must be 600" >&2
+    exit 1
+  fi
+done
+IOT_ENDPOINT="$(tr -d '\r\n' < "$IOT_DIR/endpoint")"
+if [[ ! "$IOT_ENDPOINT" =~ ^[a-z0-9-]+\.iot\.[a-z0-9-]+\.amazonaws\.com$ ]]; then
+  echo "STOP: IoT endpoint file has an invalid value" >&2
+  exit 1
+fi
+IOT_TOPIC="cxe/$CODE/gw/events"
+IOT_CLIENT_ID="consumer-$CODE"
+IOT_DEVICE_IDS=""
+for DEVICE_NUMBER in {1..10}; do
+  printf -v DEVICE_ID '%s-d%02d' "$CODE" "$DEVICE_NUMBER"
+  IOT_DEVICE_IDS+="${IOT_DEVICE_IDS:+,}$DEVICE_ID"
+done
+
 COMMIT_REF="${1:-HEAD}"
 FULL_COMMIT="$(git rev-parse --verify --end-of-options "${COMMIT_REF}^{commit}")"
 if ! git ls-files --error-unmatch deploy/deploy.sh >/dev/null 2>&1 || [[ -n "$(git status --porcelain -- deploy/deploy.sh)" ]]; then
   echo "STOP: commit deploy/deploy.sh before deployment" >&2
   exit 1
 fi
-if [[ -n "$(git status --porcelain -- app/service.py deploy/nginx.conf)" ]]; then
-  echo "STOP: commit app/service.py and deploy/nginx.conf before deployment" >&2
+if [[ -n "$(git status --porcelain -- app/service.py app/consumer.py deploy/nginx.conf deploy/make_user_data.py)" ]]; then
+  echo "STOP: commit the W6 service, consumer, deploy config, and bundler before deployment" >&2
   exit 1
 fi
-if ! git cat-file -e "${FULL_COMMIT}:app/service.py" || ! git cat-file -e "${FULL_COMMIT}:deploy/nginx.conf"; then
-  echo "STOP: selected commit lacks a deployable service or nginx config" >&2
+if ! git cat-file -e "${FULL_COMMIT}:app/service.py" \
+    || ! git cat-file -e "${FULL_COMMIT}:app/consumer.py" \
+    || ! git cat-file -e "${FULL_COMMIT}:deploy/nginx.conf" \
+    || ! git cat-file -e "${FULL_COMMIT}:deploy/make_user_data.py"; then
+  echo "STOP: selected commit lacks the W6 service, consumer, or deployment bundle inputs" >&2
   exit 1
 fi
 
@@ -192,17 +232,17 @@ python3 deploy/make_user_data.py "$FULL_COMMIT" "$USER_DATA"
 trap 'rm -f -- "$USER_DATA"' EXIT
 
 cat <<PREVIEW
-W4 deployment preview (no AWS resources will be created or Security Group rules changed):
+W6 deployment preview (no AWS resources will be created or Security Group rules changed):
   Instance       : $INSTANCE_ID ($PUBLIC_IP, running)
   Security Group : $SG_ID (TCP 22/80 remain restricted to $CURRENT_CIDR)
   Current version: $OLD_VERSION
   New commit     : $FULL_COMMIT
-  Rollback       : redeploy current version $OLD_VERSION if W4 verification fails
-  Secret files   : local mode 600; tokens and optional DB settings sent only over SSH stdin;
-                   remote root-owned mode 600
-  Service impact : inspection restarts; in-memory events are cleared; brief HTTP interruption
+  Previous       : $OLD_VERSION
+  Secret files   : local mode 600; tokens, DB settings, and consumer certificates sent only over SSH stdin;
+                   app.env root-owned mode 600; /etc/inspection/iot inspection-owned mode 700/600
+  Service impact : inspection and inspection-consumer restart; brief HTTP/MQTT interruption
   New resources  : none; no additional resource charges. Existing running EC2/EBS/IP charges continue.
-  Recovery       : rerun with $OLD_VERSION and the same token file; W3 rollback will not expose W4 endpoints.
+  Recovery       : redeploy the previous commit using this reviewed W6 deployment procedure.
 PREVIEW
 if [[ ! -t 0 ]]; then
   echo "STOP: interactive confirmation is required; no deployment performed" >&2
@@ -219,20 +259,46 @@ SSH_TARGET="${SSH_USER}@${PUBLIC_IP}"
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" true
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo bash -s' < "$USER_DATA"
 ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo install -d -o root -g root -m 755 /etc/inspection'
+ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot'
+for IOT_FILE in AmazonRootCA1.pem consumer.cert.pem consumer.private.key; do
+  printf -v REMOTE_COPY_COMMAND \
+    "sudo sh -c 'umask 077; cat > /etc/inspection/iot/%s; chown inspection:inspection /etc/inspection/iot/%s; chmod 600 /etc/inspection/iot/%s'" \
+    "$IOT_FILE" "$IOT_FILE" "$IOT_FILE"
+  # The filename is selected from the fixed allowlist in this loop.
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" \
+    "$REMOTE_COPY_COMMAND" \
+    < "$IOT_DIR/$IOT_FILE"
+done
 COMBINED_ENV="$(mktemp .local/deploy-env.XXXXXX)"
 trap 'rm -f -- "$USER_DATA" "$COMBINED_ENV"' EXIT
 cat "$APP_ENV" > "$COMBINED_ENV"
 if [[ -f "$DB_ENV" && ! -L "$DB_ENV" ]]; then
   cat "$DB_ENV" >> "$COMBINED_ENV"
 fi
+printf 'IOT_ENDPOINT=%s\nIOT_TOPIC=%s\nIOT_CLIENT_ID=%s\nIOT_DEVICE_IDS=%s\nIOT_CA=/etc/inspection/iot/AmazonRootCA1.pem\nIOT_CERT=/etc/inspection/iot/consumer.cert.pem\nIOT_KEY=/etc/inspection/iot/consumer.private.key\n' \
+  "$IOT_ENDPOINT" "$IOT_TOPIC" "$IOT_CLIENT_ID" "$IOT_DEVICE_IDS" >> "$COMBINED_ENV"
 chmod 600 "$COMBINED_ENV"
-ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo python3 -c '\''import os,sys; data=sys.stdin.buffer.read(8193); allowed={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN=",b"DB_HOST=",b"DB_PORT=",b"DB_NAME=",b"DB_USER=",b"DB_PASSWORD="}; lines=data.splitlines(); keys=[line.partition(b"=")[0]+b"=" for line in lines]; values=[line.partition(b"=")[2] for line in lines]; required={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN="}; assert len(data)<=8192 and len(lines) in (2,7) and len(set(keys))==len(keys) and required.issubset(set(keys)) and set(keys).issubset(allowed) and all(values); assert values[keys.index(b"REPORTER_TOKEN=")] != values[keys.index(b"OPERATOR_TOKEN=")]; fd=os.open("/etc/inspection/app.env",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600); os.fchown(fd,0,0); os.fchmod(fd,0o600); stream=os.fdopen(fd,"wb"); stream.write(data); stream.close()'\''' < "$COMBINED_ENV"
+ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo python3 -c '\''import os,re,sys; data=sys.stdin.buffer.read(8193); allowed={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN=",b"DB_HOST=",b"DB_PORT=",b"DB_NAME=",b"DB_USER=",b"DB_PASSWORD=",b"IOT_ENDPOINT=",b"IOT_TOPIC=",b"IOT_CLIENT_ID=",b"IOT_DEVICE_IDS=",b"IOT_CA=",b"IOT_CERT=",b"IOT_KEY="}; required={b"REPORTER_TOKEN=",b"OPERATOR_TOKEN=",b"IOT_ENDPOINT=",b"IOT_TOPIC=",b"IOT_CLIENT_ID=",b"IOT_DEVICE_IDS=",b"IOT_CA=",b"IOT_CERT=",b"IOT_KEY="}; db={b"DB_HOST=",b"DB_PORT=",b"DB_NAME=",b"DB_USER=",b"DB_PASSWORD="}; lines=data.splitlines(); keys=[line.partition(b"=")[0]+b"=" for line in lines]; values=[line.partition(b"=")[2] for line in lines]; assert len(data)<=8192 and len(set(keys))==len(keys) and set(keys) in (required,required|db) and set(keys).issubset(allowed) and all(values); v=dict(zip(keys,values)); assert v[b"REPORTER_TOKEN="] != v[b"OPERATOR_TOKEN="]; code=v[b"IOT_CLIENT_ID="].decode("ascii").removeprefix("consumer-"); assert re.fullmatch(r"[A-Za-z0-9-]{1,40}",code) and v[b"IOT_TOPIC="]==b"cxe/"+code.encode()+b"/gw/events"; assert re.fullmatch(rb"[a-z0-9-]+\.iot\.[a-z0-9-]+\.amazonaws\.com",v[b"IOT_ENDPOINT="]); assert v[b"IOT_DEVICE_IDS="]==b",".join(code.encode()+b"-d%02d"%i for i in range(1,11)); assert v[b"IOT_CA="]==b"/etc/inspection/iot/AmazonRootCA1.pem" and v[b"IOT_CERT="]==b"/etc/inspection/iot/consumer.cert.pem" and v[b"IOT_KEY="]==b"/etc/inspection/iot/consumer.private.key"; assert set(v)&db in (set(),db); fd=os.open("/etc/inspection/app.env",os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600); os.fchown(fd,0,0); os.fchmod(fd,0o600); stream=os.fdopen(fd,"wb"); stream.write(data); stream.close()'\''' < "$COMBINED_ENV"
 REMOTE_SECRET_MODE="$(ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo stat -c "%a %U %G" /etc/inspection/app.env')"
 if [[ "$REMOTE_SECRET_MODE" != "600 root root" ]]; then
   echo "STOP: remote secret-file owner or mode is incorrect" >&2
   exit 1
 fi
-ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo systemctl restart inspection'
+REMOTE_IOT_MODES="$(ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo sh -c '\''stat -c "%a %U %n" /etc/inspection /etc/inspection/iot /etc/inspection/iot/*'\''')"
+EXPECTED_IOT_MODES="$(printf '%s\n' \
+  '755 root /etc/inspection' \
+  '700 inspection /etc/inspection/iot' \
+  '600 inspection /etc/inspection/iot/AmazonRootCA1.pem' \
+  '600 inspection /etc/inspection/iot/consumer.cert.pem' \
+  '600 inspection /etc/inspection/iot/consumer.private.key')"
+if [[ "$REMOTE_IOT_MODES" != "$EXPECTED_IOT_MODES" ]]; then
+  echo "STOP: remote IoT file ownership or permissions are incorrect" >&2
+  exit 1
+fi
+printf 'Remote IoT permissions:\n%s\n' "$REMOTE_IOT_MODES"
+ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo systemctl restart inspection inspection-consumer'
+ssh "${SSH_OPTIONS[@]}" "$SSH_TARGET" 'sudo systemctl is-active inspection inspection-consumer'
 
 HEALTH_OUTPUT="$(curl --silent --show-error --max-time 8 --write-out $'\nHTTP_CODE:%{http_code}' "http://${PUBLIC_IP}/health")" || {
   echo "STOP: deployed /health is unreachable; use the recovery procedure above" >&2
@@ -261,4 +327,4 @@ print(
 )
 PY
 
-echo "W4 deployment completed for $INSTANCE_ID at $PUBLIC_IP, commit $FULL_COMMIT."
+echo "W6 deployment completed for $INSTANCE_ID at $PUBLIC_IP, commit $FULL_COMMIT."

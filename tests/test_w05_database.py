@@ -59,6 +59,15 @@ class FakeCursor:
         if "FROM events WHERE event_id = %s" in statement:
             self.row = FakeDatabase.rows.get(params[0])
             return
+        if "FROM events WHERE device_id = %s" in statement:
+            device_id, limit = params
+            ordered = sorted(
+                (row for row in FakeDatabase.rows.values() if row[1] == device_id),
+                key=lambda item: (item[5], item[0]),
+                reverse=True,
+            )
+            self.rows = ordered[:limit]
+            return
         if "FROM events ORDER BY" in statement:
             limit = params[0]
             ordered = sorted(
@@ -224,6 +233,49 @@ class PostgresEventApi(unittest.TestCase):
         self.assertIn("%s", insert[0])
         self.assertEqual(insert[1][0], "group7-1-w05-0001")
         self.assertNotIn("group7-1-w05-0001", insert[0])
+
+    def test_operator_can_filter_events_by_device_id(self):
+        first = self.event()
+        second = dict(
+            self.event(),
+            event_id="group7-1-w05-0002",
+            device_id="g7-device-02",
+        )
+        self.assertEqual(
+            self.request("POST", "/events", first, "synthetic-reporter-token")[0],
+            201,
+        )
+        self.assertEqual(
+            self.request("POST", "/events", second, "synthetic-reporter-token")[0],
+            201,
+        )
+
+        status, events = self.request(
+            "GET",
+            "/events?device_id=g7-device-01",
+            token="synthetic-operator-token",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([event["device_id"] for event in events], ["g7-device-01"])
+        query, params = next(
+            (sql, params) for sql, params in FakeDatabase.calls
+            if "WHERE device_id = %s" in sql
+        )
+        self.assertIn("ORDER BY received_at DESC", query)
+        self.assertEqual(params, ("g7-device-01", 50))
+
+    def test_operator_device_filter_rejects_invalid_or_duplicate_parameters(self):
+        for path, expected_error in (
+            ("/events?device_id=bad%20id", "invalid_identifier"),
+            ("/events?device_id=one&device_id=two", "invalid_query"),
+            ("/events?unexpected=value", "invalid_query"),
+        ):
+            with self.subTest(path=path):
+                status, body = self.request(
+                    "GET", path, token="synthetic-operator-token"
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"], expected_error)
 
 
 if __name__ == "__main__":

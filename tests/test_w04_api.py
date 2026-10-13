@@ -156,6 +156,28 @@ class EventApiContract(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assert_error(result, "event_id")
 
+    def test_operator_can_filter_in_memory_events_by_device_id(self):
+        first = self.fixture("event-valid.json")
+        second = dict(
+            first,
+            event_id="group7-1-0002",
+            device_id="g7-device-02",
+        )
+        self.assertEqual(
+            self.request("POST", "/events", first, REPORTER_TOKEN)[0],
+            201,
+        )
+        self.assertEqual(
+            self.request("POST", "/events", second, REPORTER_TOKEN)[0],
+            201,
+        )
+
+        status, events = self.request(
+            "GET", "/events?device_id=g7-device-01", token=OPERATOR_TOKEN
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([item["device_id"] for item in events], ["g7-device-01"])
+
     def test_operator_list_returns_only_latest_50_events(self):
         event = self.fixture("event-valid.json")
         for index in range(51):
@@ -197,6 +219,8 @@ class EventApiContract(unittest.TestCase):
         self.assertNotIn("localStorage", source)
         self.assertNotIn("sessionStorage", source)
         self.assertNotIn("?token=", source)
+        self.assertIn('id="device-id"', source)
+        self.assertIn("encodeURIComponent(deviceId)", source)
         self.assertNotIn(REPORTER_TOKEN, source)
         self.assertNotIn(OPERATOR_TOKEN, source)
 
