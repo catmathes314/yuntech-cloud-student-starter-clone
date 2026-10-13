@@ -40,6 +40,22 @@ class ConsumerAllowList(unittest.TestCase):
                 consumer.forward_event(payload, self.allowed, "synthetic-secret-token")
         return output.getvalue().strip(), request
 
+    def test_required_reporter_token_stays_text_for_http_header(self):
+        environment = {
+            "IOT_ENDPOINT": "example-ats.iot.us-east-1.amazonaws.com",
+            "IOT_TOPIC": "cxe/g03-m2/gw/events",
+            "IOT_CLIENT_ID": "consumer-g03-m2",
+            "IOT_DEVICE_IDS": ",".join(sorted(self.allowed)),
+            "IOT_CA": "/etc/inspection/iot/AmazonRootCA1.pem",
+            "IOT_CERT": "/etc/inspection/iot/consumer.cert.pem",
+            "IOT_KEY": "/etc/inspection/iot/consumer.private.key",
+            "REPORTER_TOKEN": "synthetic-secret-token",
+        }
+        with patch.dict(consumer.os.environ, environment, clear=True):
+            settings, _ = consumer.required_environment()
+        self.assertEqual(settings["REPORTER_TOKEN"], "synthetic-secret-token")
+        self.assertIsInstance(settings["REPORTER_TOKEN"], str)
+
     def test_allow_list_is_checked_before_api_request(self):
         payload = self.event.replace(b"g03-m2-d01", b"g03-m2-d99")
         output, request = self.call(payload, 201)

@@ -136,10 +136,7 @@ def run():
     ca_file = validate_secret_file(settings["IOT_CA"])
     cert_file = validate_secret_file(settings["IOT_CERT"])
     key_file = validate_secret_file(settings["IOT_KEY"])
-    try:
-        reporter_token = settings["REPORTER_TOKEN"].encode("ascii")
-    except UnicodeEncodeError:
-        raise ConsumerError("REPORTER_TOKEN must be ASCII.") from None
+    reporter_token = settings["REPORTER_TOKEN"]
 
     def on_connect(client, userdata, flags, reason_code, properties):
         reason = int(getattr(reason_code, "value", reason_code))
