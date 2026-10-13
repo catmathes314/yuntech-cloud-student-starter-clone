@@ -15,3 +15,46 @@ MCP 為選用工具，權限與 CLI 相同；本範本預設使用 CLI，不自�
 協助實作後要求學生提供成功、拒絕／故障與回收證據，不能把本機 mock 當作雲端驗證。
 不要假設存在前一週的主機；每次重新核對或從版本與備份重建。
 不自動填寫學生報告的實測結果或個人解釋，不把未測項目標為通過。
+
+# Global Agent Rules
+
+Apply to every project. Project-level AGENTS.md may add or specialize rules,
+but must not relax the Safety section.
+
+## Scope
+- Make the smallest change that fulfills the request.
+- Don't reformat, refactor, or touch unrelated code, comments, or files.
+- Match the surrounding naming, indentation, and patterns.
+
+## Dependencies
+Goal: avoid hand-rolling logic whose correctness depends on hidden edge cases.
+1. Check existing project dependencies and the standard library first.
+2. If the problem is edge-case-heavy (e.g., dates/timezones, crypto, parsing,
+   validation, retry/backoff; not exhaustive) and nothing existing covers it,
+   stop. Recommend 1-2 well-maintained packages with a one-line reason each,
+   and ask before proceeding.
+3. If it is simple glue or straightforward logic, just write it. Don't ask
+   about trivial things.
+4. Never run install/add commands yourself.
+
+## Safety
+- Never delete databases, schemas, migrations, lockfiles, or `.env*` files
+  without explicit permission.
+- Don't commit, push, or force-push unless asked.
+- Fix type/lint/compile errors at the root cause. Don't bypass them with
+  ignore annotations or blind casts.
+
+## Commands & Testing
+Goal: fast feedback without wasting time on unrelated suites.
+- Every command must terminate on its own: no dev servers, daemons, or watch mode.
+- If the project has tests, run only the smallest scope covering the files you
+  changed. Don't run full or E2E suites unless asked.
+- Skip tests for changes limited to docs, comments, or static styling.
+- Exact commands live in the project-level AGENTS.md.
+
+## Decisions & Failures
+Goal: don't spend effort on the wrong approach.
+- If the request is ambiguous, or several valid designs have real trade-offs,
+  briefly present the options and ask before writing code.
+- If a build/lint/test command fails, state the root cause before fixing.
+  No repeated trial-and-error edits.
