@@ -68,7 +68,7 @@ class IoTPolicyTests(unittest.TestCase):
                     return {
                         "certificateId": f"{certificate_count:064x}",
                         "certificatePem": "-----BEGIN CERTIFICATE-----\ncertificate\n",
-                        "keyPair": {"PrivateKey": "-----BEGIN PRIVATE KEY-----SYNTHETIC"},
+                        "keyPair": {"PrivateKey": "-----BEGIN SYNTHETIC KEY-----SYNTHETIC"},
                     }
                 if args[:2] == ["iot", "get-policy"]:
                     name = args[args.index("--policy-name") + 1]
