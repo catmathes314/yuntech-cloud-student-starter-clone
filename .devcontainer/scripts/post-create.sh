@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+git config --global --add safe.directory '*'
 cd "$(dirname "$0")/../.."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends jq curl unzip shellcheck
